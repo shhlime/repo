@@ -2,7 +2,8 @@
 
 Crashes: Black Monday (1987), dot-com (2000), financial crisis (2007), COVID (2020).
 Each fund group is bought at the close of its own index's closing high (S&P 500
-for SPY/SSO/UPRO, Nasdaq-100 for QQQ/QLD/TQQQ), found from the data.
+for SPY/SSO/UPRO, Nasdaq-100 for QQQ/QLD/TQQQ, semiconductors for SOXX/USD/SOXL),
+found from the data.
 
 Assumptions: dividends reinvested, no taxes, nominal dollars, and a simulated
 fund is assumed to stay open however far it falls.
@@ -14,14 +15,24 @@ closes, which were noisy before ~2011):
     dividend yield (1988-92 actual was ~3.4%).
   - Nasdaq-100: ^NDX plus QQQ's dividends; before QQQ (1999) dividends are
     assumed to be 0.2%/yr (QQQ's fee, which they roughly offset in 1999-2004).
+  - Semiconductors: ^SOX plus SOXX's dividends (0.3%/yr assumed before SOXX,
+    its 2001-10 yield); before ^SOX starts (May 1994), the Ken French "Chips"
+    value-weighted industry
+    portfolio, which includes dividends but is broader (electronic equipment)
+    and ~20% less volatile than ^SOX, so pre-1994 leveraged semis are optimistic.
   - 1x before launch: index total return minus the ETF's expense ratio.
   - Lx before launch: L * index_tr - (L - 1) * (tbill + spread)/252 - 0.95%/252,
     where `spread` is fitted so the formula reproduces the real fund's own
-    history. Crisis-era spreads ran higher, so simulated stretches through
+    history. USD tracks a different, Nvidia-heavier semis index than ^SOX, so
+    it reuses SOXL's spread rather than absorbing that index gap. Crisis-era spreads ran higher, so simulated stretches through
     2000-02 or 2008 are still somewhat optimistic.
 
 Run: pip install yfinance pandas && python sim_crash_peaks.py
 """
+import io
+import urllib.request
+import zipfile
+
 import pandas as pd
 import yfinance as yf
 
@@ -40,11 +51,28 @@ FUNDS = [  # label, index group, leverage, ticker
     ("Nasdaq-100 (QQQ)", "NDX", 1, "QQQ"),
     ("2x Nasdaq-100 (QLD)", "NDX", 2, "QLD"),
     ("3x Nasdaq-100 (TQQQ)", "NDX", 3, "TQQQ"),
+    ("Semiconductors (SOXX)", "SOX", 1, "SOXX"),
+    ("2x Semiconductors (USD)", "SOX", 2, "USD"),
+    ("3x Semiconductors (SOXL)", "SOX", 3, "SOXL"),
 ]
-INDEX = {"SPX": "^GSPC", "NDX": "^NDX"}
-ETF_FEE = {"SPY": 0.000945, "QQQ": 0.0020}
+ETF_FEE = {"SPY": 0.000945, "QQQ": 0.0020, "SOXX": 0.0045}
+FRENCH_URL = ("https://mba.tuck.dartmouth.edu/pages/faculty/ken.french/ftp/"
+              "49_Industry_Portfolios_daily_CSV.zip")
 
-raw = yf.download(["SPY", "QQQ", "SSO", "QLD", "UPRO", "TQQQ", "^IRX", "^GSPC", "^NDX", "^SP500TR"],
+
+def french_chips():
+    """Daily value-weighted 'Chips' industry returns from Ken French's library."""
+    with urllib.request.urlopen(FRENCH_URL, timeout=60) as f:
+        text = zipfile.ZipFile(io.BytesIO(f.read())).read("49_Industry_Portfolios_Daily.csv").decode()
+    lines = text.splitlines()
+    start = next(i for i, l in enumerate(lines) if "Value Weighted Returns -- Daily" in l)
+    end = next(i for i, l in enumerate(lines) if "Equal Weighted Returns -- Daily" in l)
+    df = pd.read_csv(io.StringIO("\n".join(lines[start + 1:end])), index_col=0)
+    df.index = pd.to_datetime(df.index.astype(str).str.strip(), format="%Y%m%d")
+    return df["Chips"].astype(float) / 100
+
+raw = yf.download(["SPY", "QQQ", "SSO", "QLD", "UPRO", "TQQQ", "SOXX", "USD", "SOXL",
+                   "^IRX", "^GSPC", "^NDX", "^SP500TR", "^SOX"],
                   start="1985-10-01", auto_adjust=False, progress=False)
 px, close = raw["Adj Close"], raw["Close"]
 keep = px["^GSPC"].notna() & (px.index < pd.Timestamp.today().normalize())  # no partial live row
@@ -53,10 +81,23 @@ cash = (px["^IRX"] / 100).ffill().bfill()  # 13-week T-bill yield
 rets = px.pct_change()
 
 # Index total returns used to simulate funds before they existed.
-qqq_div = ((1 + rets["QQQ"]) / (1 + close["QQQ"].pct_change()) - 1).fillna(0.0020 / 252)
+
+
+def dividends(ticker, assumed):
+    """Daily dividend return of an ETF; `assumed` annual yield before it existed."""
+    div = (1 + rets[ticker]) / (1 + close[ticker].pct_change()) - 1
+    return div.where(rets[ticker].notna(), assumed / 252)
+
+
 INDEX_TR = {
     "SPX": rets["^SP500TR"].fillna(rets["^GSPC"] + 0.03 / 252),
-    "NDX": rets["^NDX"].fillna(0) + qqq_div.where(rets["QQQ"].notna(), 0.0020 / 252),
+    "NDX": rets["^NDX"].fillna(0) + dividends("QQQ", 0.0020),
+    "SOX": (rets["^SOX"] + dividends("SOXX", 0.0030)).fillna(french_chips().reindex(px.index).fillna(0)),
+}
+LEVEL = {  # what "the index's closing high" is measured on
+    "SPX": px["^GSPC"],
+    "NDX": px["^NDX"],
+    "SOX": (1 + INDEX_TR["SOX"]).cumprod(),
 }
 
 
@@ -79,7 +120,8 @@ def fit_spread(group, lev, ticker):
     return mid
 
 
-SPREAD = {t: fit_spread(g, l, t) for _, g, l, t in FUNDS if l > 1}
+SPREAD = {t: fit_spread(g, l, t) for _, g, l, t in FUNDS if l > 1 and t != "USD"}
+SPREAD["USD"] = SPREAD["SOXL"]
 
 
 def fund_returns(group, lev, ticker):
@@ -113,7 +155,7 @@ def simulate(r, buy):
         for_good = "never" if below.iloc[-1] else value.index[value.index > last_below][0].date()
     years = (value.index[-1] - buy).days / 365.25
     return {
-        "Lowest $": f"{value.min():,.0f} ({pct(value.min() / START_CASH - 1)}, {value.idxmin().date()})",
+        "Lowest $": f"{value.min():,.{2 if value.min() < 100 else 0}f} ({pct(value.min() / START_CASH - 1)}, {value.idxmin().date()})",
         "Worst drop from a high": f"{pct(value[worst] / peak[worst] - 1)} ({value.loc[:worst].idxmax().date() if value.loc[:worst].max() > START_CASH else buy.date()} to {worst.date()})",
         "First back to $50k": first_back,
         "Back for good": for_good,
@@ -129,7 +171,7 @@ print("Fitted extra financing over T-bills (per borrowed unit, per year):",
 for crash, (lo, hi) in CRASHES.items():
     rows = []
     for label, group, lev, ticker in FUNDS:
-        buy = px[INDEX[group]].loc[lo:hi].idxmax()
+        buy = LEVEL[group].loc[lo:hi].idxmax()
         r, launch = fund_returns(group, lev, ticker)
         note = f"simulated before {launch.date()}" if launch > buy else "real"
         rows.append({"Fund": label, "Bought": buy.date(), **simulate(r, buy), "Prices": note})
