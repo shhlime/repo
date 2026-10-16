@@ -1,4 +1,4 @@
-"""Buy-and-hold $50k at a market peak in 1x/2x/3x S&P 500 and Nasdaq-100 ETFs.
+"""Buy-and-hold $50k at a market peak in 1x/2x/3x index and semiconductor ETFs.
 
 Crashes: Black Monday (1987), dot-com (2000), financial crisis (2007), COVID (2020).
 Each fund group is bought at the close of its own index's closing high (S&P 500
@@ -16,23 +16,20 @@ closes, which were noisy before ~2011):
   - Nasdaq-100: ^NDX plus QQQ's dividends; before QQQ (1999) dividends are
     assumed to be 0.2%/yr (QQQ's fee, which they roughly offset in 1999-2004).
   - Semiconductors: ^SOX plus SOXX's dividends (0.3%/yr assumed before SOXX,
-    its 2001-10 yield); before ^SOX starts (May 1994), the Ken French "Chips"
-    value-weighted industry
-    portfolio, which includes dividends but is broader (electronic equipment)
-    and ~20% less volatile than ^SOX, so pre-1994 leveraged semis are optimistic.
+    its 2001-10 yield). Before ^SOX starts (May 1994): an equal-weighted,
+    monthly-rebalanced basket of chip stocks Yahoo has back to 1987, minus
+    5.2%/yr for survivorship bias (its measured excess over ^SOX in 1994-2010;
+    it tracked ^SOX with beta ~1.0, correlation 0.94-0.97). Ken French's
+    "Chips" portfolio was rejected: ~40% less volatile than semis in 1987-94.
   - 1x before launch: index total return minus the ETF's expense ratio.
   - Lx before launch: L * index_tr - (L - 1) * (tbill + spread)/252 - 0.95%/252,
     where `spread` is fitted so the formula reproduces the real fund's own
     history. USD tracks a different, Nvidia-heavier semis index than ^SOX, so
-    it reuses SOXL's spread rather than absorbing that index gap. Crisis-era spreads ran higher, so simulated stretches through
-    2000-02 or 2008 are still somewhat optimistic.
+    it reuses SOXL's spread. Crisis-era spreads ran higher, so simulated
+    stretches through 2000-02 or 2008 are still somewhat optimistic.
 
 Run: pip install yfinance pandas && python sim_crash_peaks.py
 """
-import io
-import urllib.request
-import zipfile
-
 import pandas as pd
 import yfinance as yf
 
@@ -56,31 +53,17 @@ FUNDS = [  # label, index group, leverage, ticker
     ("3x Semiconductors (SOXL)", "SOX", 3, "SOXL"),
 ]
 ETF_FEE = {"SPY": 0.000945, "QQQ": 0.0020, "SOXX": 0.0045}
-FRENCH_URL = ("https://mba.tuck.dartmouth.edu/pages/faculty/ken.french/ftp/"
-              "49_Industry_Portfolios_daily_CSV.zip")
-
-
-def french_chips():
-    """Daily value-weighted 'Chips' industry returns from Ken French's library."""
-    with urllib.request.urlopen(FRENCH_URL, timeout=60) as f:
-        text = zipfile.ZipFile(io.BytesIO(f.read())).read("49_Industry_Portfolios_Daily.csv").decode()
-    lines = text.splitlines()
-    start = next(i for i, l in enumerate(lines) if "Value Weighted Returns -- Daily" in l)
-    end = next(i for i, l in enumerate(lines) if "Equal Weighted Returns -- Daily" in l)
-    df = pd.read_csv(io.StringIO("\n".join(lines[start + 1:end])), index_col=0)
-    df.index = pd.to_datetime(df.index.astype(str).str.strip(), format="%Y%m%d")
-    return df["Chips"].astype(float) / 100
+CHIP_STOCKS = ["INTC", "TXN", "AMD", "MU", "AMAT", "KLAC", "LRCX", "ADI"]
+SURVIVOR_HAIRCUT = 0.052
 
 raw = yf.download(["SPY", "QQQ", "SSO", "QLD", "UPRO", "TQQQ", "SOXX", "USD", "SOXL",
-                   "^IRX", "^GSPC", "^NDX", "^SP500TR", "^SOX"],
+                   "^IRX", "^GSPC", "^NDX", "^SP500TR", "^SOX", *CHIP_STOCKS],
                   start="1985-10-01", auto_adjust=False, progress=False)
-px, close = raw["Adj Close"], raw["Close"]
-keep = px["^GSPC"].notna() & (px.index < pd.Timestamp.today().normalize())  # no partial live row
-px, close = px[keep], close[keep]
-cash = (px["^IRX"] / 100).ffill().bfill()  # 13-week T-bill yield
+keep = raw.index[raw["Adj Close"]["^GSPC"].notna() & (raw.index < pd.Timestamp.today().normalize())]
+px = raw["Adj Close"].loc[keep].ffill()  # a missing day becomes 0%, not a lost move
+close = raw["Close"].loc[keep].ffill()
+cash = (px["^IRX"] / 100).bfill()  # 13-week T-bill yield
 rets = px.pct_change()
-
-# Index total returns used to simulate funds before they existed.
 
 
 def dividends(ticker, assumed):
@@ -89,15 +72,26 @@ def dividends(ticker, assumed):
     return div.where(rets[ticker].notna(), assumed / 252)
 
 
+def chip_basket():
+    """Equal-weighted chip stocks, rebalanced monthly, net of the survivorship haircut."""
+    stocks, prev = px[CHIP_STOCKS], px[CHIP_STOCKS].shift(1)
+    months = []
+    for _, block in stocks.groupby(stocks.index.to_period("M")):
+        level = (block / prev.loc[block.index[0]]).mean(axis=1)  # weights reset at prior close
+        months.append(level / level.shift(1, fill_value=1) - 1)
+    return pd.concat(months) - SURVIVOR_HAIRCUT / 252
+
+
+# Index total returns used to simulate funds before they existed.
 INDEX_TR = {
     "SPX": rets["^SP500TR"].fillna(rets["^GSPC"] + 0.03 / 252),
     "NDX": rets["^NDX"].fillna(0) + dividends("QQQ", 0.0020),
-    "SOX": (rets["^SOX"] + dividends("SOXX", 0.0030)).fillna(french_chips().reindex(px.index).fillna(0)),
+    "SOX": (rets["^SOX"] + dividends("SOXX", 0.0030)).fillna(chip_basket()),
 }
 LEVEL = {  # what "the index's closing high" is measured on
     "SPX": px["^GSPC"],
     "NDX": px["^NDX"],
-    "SOX": (1 + INDEX_TR["SOX"]).cumprod(),
+    "SOX": (1 + INDEX_TR["SOX"].fillna(0)).cumprod(),
 }
 
 
@@ -136,7 +130,7 @@ def fund_returns(group, lev, ticker):
 
 
 def pct(x):
-    return f"{x:.2%}" if x < -0.995 else f"{x:.1%}"
+    return f"{x:.4%}" if x < -0.9999 else f"{x:.2%}" if x < -0.995 else f"{x:.1%}"
 
 
 def simulate(r, buy):
@@ -144,6 +138,7 @@ def simulate(r, buy):
     value = START_CASH * (1 + r).cumprod()
     peak = value.cummax().clip(lower=START_CASH)
     worst = (value / peak - 1).idxmin()
+    worst_from = value.loc[:worst].idxmax() if value.loc[:worst].max() > START_CASH else buy
     below = value < START_CASH
     if not below.any():
         first_back = for_good = "never fell below"
@@ -154,9 +149,10 @@ def simulate(r, buy):
         last_below = below[below].index[-1]
         for_good = "never" if below.iloc[-1] else value.index[value.index > last_below][0].date()
     years = (value.index[-1] - buy).days / 365.25
+    low = value.min()
     return {
-        "Lowest $": f"{value.min():,.{2 if value.min() < 100 else 0}f} ({pct(value.min() / START_CASH - 1)}, {value.idxmin().date()})",
-        "Worst drop from a high": f"{pct(value[worst] / peak[worst] - 1)} ({value.loc[:worst].idxmax().date() if value.loc[:worst].max() > START_CASH else buy.date()} to {worst.date()})",
+        "Lowest $": f"{low:,.{2 if low < 100 else 0}f} ({pct(low / START_CASH - 1)}, {value.idxmin().date()})",
+        "Worst drop from a high": f"{pct(value[worst] / peak[worst] - 1)} ({worst_from.date()} to {worst.date()})",
         "First back to $50k": first_back,
         "Back for good": for_good,
         f"Value {value.index[-1].date()}": f"{value.iloc[-1]:,.0f}",
